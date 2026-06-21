@@ -270,13 +270,13 @@ class Af_ReadabilityExtension extends Minz_Extension
 		]);
 
 		if ($result === null) {
-			Minz_Log::warning('af-readability: Discourse RSS fetch failed for ' . $rssUrl);
+			Minz_Log::warning('af-readability: Discourse RSS fetch failed for ' . $rssUrl . '; trying article HTML fallback');
 			return false;
 		}
 
 		$content = $this->parseDiscourseTopicRss($result['body'], $result['effectiveUrl']);
 		if ($content === null) {
-			Minz_Log::warning('af-readability: Discourse RSS parse returned no posts for ' . $result['effectiveUrl']);
+			Minz_Log::warning('af-readability: Discourse RSS parse returned no posts for ' . $result['effectiveUrl'] . '; trying article HTML fallback');
 			return false;
 		}
 
@@ -315,6 +315,27 @@ class Af_ReadabilityExtension extends Minz_Extension
 	}
 
 	private function parseDiscourseTopicRss(string $rss, string $rssUrl): ?string
+	{
+		$topic = $this->parseDiscourseTopicRssWithDom($rss);
+		if ($topic === null) {
+			$topic = $this->parseDiscourseTopicRssWithRegex($rss);
+		}
+
+		if ($topic === null || empty($topic['posts'])) {
+			return null;
+		}
+
+		return $this->renderDiscourseTopic($topic['title'], $topic['topicLink'], $topic['posts'], $rssUrl);
+	}
+
+	/**
+	 * @return array{
+	 *   title:string,
+	 *   topicLink:string,
+	 *   posts:array<int,array{author:string,content:string,link:string,date:string}>
+	 * }|null
+	 */
+	private function parseDiscourseTopicRssWithDom(string $rss): ?array
 	{
 		$document = new DOMDocument("1.0", "UTF-8");
 
@@ -356,6 +377,64 @@ class Af_ReadabilityExtension extends Minz_Extension
 			return null;
 		}
 
+		return [
+			'title' => $title,
+			'topicLink' => $topicLink,
+			'posts' => $posts,
+		];
+	}
+
+	/**
+	 * @return array{
+	 *   title:string,
+	 *   topicLink:string,
+	 *   posts:array<int,array{author:string,content:string,link:string,date:string}>
+	 * }|null
+	 */
+	private function parseDiscourseTopicRssWithRegex(string $rss): ?array
+	{
+		$title = '';
+		$topicLink = '';
+		if (preg_match('#<channel\b[^>]*>(.*?)(?=<item\b|</channel>)#su', $rss, $channelMatch)) {
+			$title = $this->getXmlElementText($channelMatch[1], 'title');
+			$topicLink = $this->getXmlElementText($channelMatch[1], 'link');
+		}
+
+		$posts = [];
+		if (!preg_match_all('#<item\b[^>]*>(.*?)</item>#su', $rss, $itemMatches)) {
+			return null;
+		}
+
+		foreach ($itemMatches[1] as $item) {
+			$content = $this->cleanDiscoursePostContent($this->getXmlElementText($item, 'description'));
+			if (trim(strip_tags($content)) === '') {
+				continue;
+			}
+
+			$posts[] = [
+				'author' => $this->getXmlElementText($item, 'dc:creator'),
+				'content' => $content,
+				'link' => $this->getXmlElementText($item, 'link'),
+				'date' => $this->getXmlElementText($item, 'pubDate'),
+			];
+		}
+
+		if (empty($posts)) {
+			return null;
+		}
+
+		return [
+			'title' => $title,
+			'topicLink' => $topicLink,
+			'posts' => $posts,
+		];
+	}
+
+	/**
+	 * @param array<int,array{author:string,content:string,link:string,date:string}> $posts
+	 */
+	private function renderDiscourseTopic(string $title, string $topicLink, array $posts, string $rssUrl): string
+	{
 		// Discourse topic RSS is newest-first; FreshRSS article content is easier to read oldest-first.
 		$posts = array_reverse($posts);
 		$html = '<article class="af-readability-discourse-topic">';
@@ -397,6 +476,20 @@ class Af_ReadabilityExtension extends Minz_Extension
 		$html .= '</article>';
 
 		return $html;
+	}
+
+	private function getXmlElementText(string $xml, string $tagName): string
+	{
+		$quotedTagName = preg_quote($tagName, '#');
+		if (preg_match('#<' . $quotedTagName . '\b[^>]*>\s*<!\[CDATA\[(.*?)\]\]>\s*</' . $quotedTagName . '>#su', $xml, $matches)) {
+			return trim($matches[1]);
+		}
+
+		if (preg_match('#<' . $quotedTagName . '\b[^>]*>(.*?)</' . $quotedTagName . '>#su', $xml, $matches)) {
+			return trim(html_entity_decode($matches[1], ENT_QUOTES | ENT_XML1, 'UTF-8'));
+		}
+
+		return '';
 	}
 
 	private function getFirstElementText(DOMElement $parent, string $tagName, ?string $namespace = null): string
@@ -442,7 +535,7 @@ class Af_ReadabilityExtension extends Minz_Extension
 				continue;
 			}
 
-			$contentNode = $this->findFirstDescendantByClass($post, 'cooked');
+			$contentNode = $this->findDiscoursePostContent($post);
 			if (!$contentNode instanceof DOMElement) {
 				continue;
 			}
@@ -477,6 +570,18 @@ class Af_ReadabilityExtension extends Minz_Extension
 		}
 
 		return trim($titleNode->textContent);
+	}
+
+	private function findDiscoursePostContent(DOMElement $post): ?DOMElement
+	{
+		foreach ($post->getElementsByTagName('*') as $element) {
+			if ($element instanceof DOMElement && $element->getAttribute('itemprop') === 'text') {
+				return $element;
+			}
+		}
+
+		return $this->findFirstDescendantByClass($post, 'cooked')
+			?? $this->findFirstDescendantByClass($post, 'post');
 	}
 
 	private function findFirstDescendantByClass(DOMElement $parent, string $className): ?DOMElement
