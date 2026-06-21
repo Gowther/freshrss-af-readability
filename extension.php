@@ -178,6 +178,7 @@ class Af_ReadabilityExtension extends Minz_Extension
 
 		$response = $result['body'];
 		$url = $result['effectiveUrl'];
+		$fetchDiagnostics = $this->formatFetchDiagnostics($result);
 
 		$document = new DOMDocument("1.0", "UTF-8");
 
@@ -203,6 +204,11 @@ class Af_ReadabilityExtension extends Minz_Extension
 			return $discourseCrawlerContent;
 		}
 
+		$discourseJsonLdContent = $this->parseDiscourseJsonLdDocument($document, $url);
+		if (is_string($discourseJsonLdContent)) {
+			return $discourseJsonLdContent;
+		}
+
 		try {
 			$r = new Readability(new Configuration([
 				'FixRelativeURLs' => true,
@@ -215,7 +221,7 @@ class Af_ReadabilityExtension extends Minz_Extension
 			}
 		}
 		catch(\Throwable $t) {
-			Minz_Log::warning('af-readability: Readability failed for ' . $url . ': ' . $t->getMessage());
+			Minz_Log::warning('af-readability: Readability failed for ' . $url . ' (' . $fetchDiagnostics . '): ' . $t->getMessage());
 			return false;
 		}
 
@@ -223,7 +229,7 @@ class Af_ReadabilityExtension extends Minz_Extension
 	}
 
 	/**
-	 * @return array{body:string,effectiveUrl:string}|null
+	 * @return array{body:string,effectiveUrl:string,httpCode:int,contentType:string}|null
 	 */
 	private function fetchUrl(string $url, array $headers): ?array
 	{
@@ -245,6 +251,8 @@ class Af_ReadabilityExtension extends Minz_Extension
 			return null;
 		}
 		$effectiveUrl = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL) ?: $url;
+		$httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+		$contentType = (string)(curl_getinfo($ch, CURLINFO_CONTENT_TYPE) ?: '');
 		curl_close($ch);
 
 		if (!is_string($response)) {
@@ -254,7 +262,26 @@ class Af_ReadabilityExtension extends Minz_Extension
 		return [
 			'body' => $response,
 			'effectiveUrl' => $effectiveUrl,
+			'httpCode' => $httpCode,
+			'contentType' => $contentType,
 		];
+	}
+
+	/**
+	 * @param array{body:string,effectiveUrl:string,httpCode:int,contentType:string} $result
+	 */
+	private function formatFetchDiagnostics(array $result): string
+	{
+		$parts = [
+			'HTTP ' . $result['httpCode'],
+			strlen($result['body']) . ' bytes',
+		];
+
+		if ($result['contentType'] !== '') {
+			$parts[] = $result['contentType'];
+		}
+
+		return implode(', ', $parts);
 	}
 
 	private function extractDiscourseContent(string $url): bool|string|null
@@ -276,7 +303,10 @@ class Af_ReadabilityExtension extends Minz_Extension
 
 		$content = $this->parseDiscourseTopicRss($result['body'], $result['effectiveUrl']);
 		if ($content === null) {
-			Minz_Log::warning('af-readability: Discourse RSS parse returned no posts for ' . $result['effectiveUrl'] . '; trying article HTML fallback');
+			Minz_Log::warning(
+				'af-readability: Discourse RSS parse returned no posts for ' . $result['effectiveUrl']
+				. ' (' . $this->formatFetchDiagnostics($result) . '); trying article HTML fallback'
+			);
 			return false;
 		}
 
@@ -395,13 +425,13 @@ class Af_ReadabilityExtension extends Minz_Extension
 	{
 		$title = '';
 		$topicLink = '';
-		if (preg_match('#<channel\b[^>]*>(.*?)(?=<item\b|</channel>)#su', $rss, $channelMatch)) {
+		if (preg_match('#<channel\b[^>]*>(.*?)(?=<item\b|</channel>)#s', $rss, $channelMatch)) {
 			$title = $this->getXmlElementText($channelMatch[1], 'title');
 			$topicLink = $this->getXmlElementText($channelMatch[1], 'link');
 		}
 
 		$posts = [];
-		if (!preg_match_all('#<item\b[^>]*>(.*?)</item>#su', $rss, $itemMatches)) {
+		if (!preg_match_all('#<item\b[^>]*>(.*?)</item>#s', $rss, $itemMatches)) {
 			return null;
 		}
 
@@ -433,16 +463,18 @@ class Af_ReadabilityExtension extends Minz_Extension
 	/**
 	 * @param array<int,array{author:string,content:string,link:string,date:string}> $posts
 	 */
-	private function renderDiscourseTopic(string $title, string $topicLink, array $posts, string $rssUrl): string
+	private function renderDiscourseTopic(string $title, string $topicLink, array $posts, string $rssUrl, bool $newestFirst = true): string
 	{
-		// Discourse topic RSS is newest-first; FreshRSS article content is easier to read oldest-first.
-		$posts = array_reverse($posts);
+		if ($newestFirst) {
+			// Discourse topic RSS is newest-first; FreshRSS article content is easier to read oldest-first.
+			$posts = array_reverse($posts);
+		}
 		$html = '<article class="af-readability-discourse-topic">';
 
 		if ($title !== '') {
-			$titleHtml = htmlspecialchars($title, ENT_QUOTES, 'UTF-8');
+			$titleHtml = htmlspecialchars($title, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 			if ($topicLink !== '') {
-				$html .= '<h1><a href="' . htmlspecialchars($topicLink, ENT_QUOTES, 'UTF-8') . '">' . $titleHtml . '</a></h1>';
+				$html .= '<h1><a href="' . htmlspecialchars($topicLink, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '">' . $titleHtml . '</a></h1>';
 			} else {
 				$html .= '<h1>' . $titleHtml . '</h1>';
 			}
@@ -450,9 +482,9 @@ class Af_ReadabilityExtension extends Minz_Extension
 
 		foreach ($posts as $index => $post) {
 			$postNumber = $index + 1;
-			$author = htmlspecialchars($post['author'], ENT_QUOTES, 'UTF-8');
-			$date = htmlspecialchars($post['date'], ENT_QUOTES, 'UTF-8');
-			$link = htmlspecialchars($post['link'], ENT_QUOTES, 'UTF-8');
+			$author = htmlspecialchars($post['author'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+			$date = htmlspecialchars($post['date'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+			$link = htmlspecialchars($post['link'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 			$heading = '#' . $postNumber;
 
 			if ($author !== '') {
@@ -472,7 +504,7 @@ class Af_ReadabilityExtension extends Minz_Extension
 			$html .= '</section>';
 		}
 
-		$html .= '<p><a href="' . htmlspecialchars($rssUrl, ENT_QUOTES, 'UTF-8') . '">Topic RSS</a></p>';
+		$html .= '<p><a href="' . htmlspecialchars($rssUrl, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '">Topic RSS</a></p>';
 		$html .= '</article>';
 
 		return $html;
@@ -481,11 +513,11 @@ class Af_ReadabilityExtension extends Minz_Extension
 	private function getXmlElementText(string $xml, string $tagName): string
 	{
 		$quotedTagName = preg_quote($tagName, '#');
-		if (preg_match('#<' . $quotedTagName . '\b[^>]*>\s*<!\[CDATA\[(.*?)\]\]>\s*</' . $quotedTagName . '>#su', $xml, $matches)) {
+		if (preg_match('#<' . $quotedTagName . '\b[^>]*>\s*<!\[CDATA\[(.*?)\]\]>\s*</' . $quotedTagName . '>#s', $xml, $matches)) {
 			return trim($matches[1]);
 		}
 
-		if (preg_match('#<' . $quotedTagName . '\b[^>]*>(.*?)</' . $quotedTagName . '>#su', $xml, $matches)) {
+		if (preg_match('#<' . $quotedTagName . '\b[^>]*>(.*?)</' . $quotedTagName . '>#s', $xml, $matches)) {
 			return trim(html_entity_decode($matches[1], ENT_QUOTES | ENT_XML1, 'UTF-8'));
 		}
 
@@ -524,8 +556,8 @@ class Af_ReadabilityExtension extends Minz_Extension
 		$html = '<article class="af-readability-discourse-topic">';
 
 		if ($title !== '') {
-			$html .= '<h1><a href="' . htmlspecialchars($url, ENT_QUOTES, 'UTF-8') . '">'
-				. htmlspecialchars($title, ENT_QUOTES, 'UTF-8')
+			$html .= '<h1><a href="' . htmlspecialchars($url, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '">'
+				. htmlspecialchars($title, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')
 				. '</a></h1>';
 		}
 
@@ -548,7 +580,7 @@ class Af_ReadabilityExtension extends Minz_Extension
 			$postNumber++;
 			$postLink = $url . '#post_' . $postNumber;
 			$html .= '<section class="af-readability-discourse-post">';
-			$html .= '<h2><a href="' . htmlspecialchars($postLink, ENT_QUOTES, 'UTF-8') . '">#' . $postNumber . '</a></h2>';
+			$html .= '<h2><a href="' . htmlspecialchars($postLink, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '">#' . $postNumber . '</a></h2>';
 			$html .= $content;
 			$html .= '</section>';
 		}
@@ -557,6 +589,202 @@ class Af_ReadabilityExtension extends Minz_Extension
 
 		if ($postNumber === 0) {
 			return null;
+		}
+
+		return $html;
+	}
+
+	private function parseDiscourseJsonLdDocument(DOMDocument $document, string $url): ?string
+	{
+		foreach ($document->getElementsByTagName('script') as $script) {
+			if (!$script instanceof DOMElement) {
+				continue;
+			}
+
+			if (strtolower(trim($script->getAttribute('type'))) !== 'application/ld+json') {
+				continue;
+			}
+
+			$schema = json_decode(trim($script->textContent), true);
+			if (!is_array($schema)) {
+				continue;
+			}
+
+			foreach ($this->flattenSchemaItems($schema) as $item) {
+				$question = null;
+				if ($this->schemaTypeMatches($item, 'QAPage')
+					&& isset($item['mainEntity'])
+					&& is_array($item['mainEntity'])
+				) {
+					$question = $item['mainEntity'];
+				} elseif ($this->schemaTypeMatches($item, 'Question')) {
+					$question = $item;
+				}
+
+				if ($question === null) {
+					continue;
+				}
+
+				$posts = [];
+				$questionContent = $this->formatSchemaText($this->schemaString($question['text'] ?? null));
+				if ($questionContent !== '') {
+					$posts[] = [
+						'author' => $this->schemaAuthorName($question),
+						'content' => $questionContent,
+						'link' => $this->schemaString($question['url'] ?? $url),
+						'date' => $this->schemaString($question['datePublished'] ?? ''),
+					];
+				}
+
+				foreach (['acceptedAnswer', 'suggestedAnswer', 'answer'] as $answerKey) {
+					foreach ($this->schemaNodeList($question[$answerKey] ?? null) as $answer) {
+						if (!is_array($answer)) {
+							continue;
+						}
+
+						$answerContent = $this->formatSchemaText($this->schemaString($answer['text'] ?? null));
+						if ($answerContent === '') {
+							continue;
+						}
+
+						$posts[] = [
+							'author' => $this->schemaAuthorName($answer),
+							'content' => $answerContent,
+							'link' => $this->schemaString($answer['url'] ?? $url),
+							'date' => $this->schemaString($answer['datePublished'] ?? ''),
+						];
+					}
+				}
+
+				if (empty($posts)) {
+					continue;
+				}
+
+				$title = $this->schemaString($question['name'] ?? '');
+				if ($title === '') {
+					$title = $this->getDocumentTitle($document);
+				}
+
+				return $this->renderDiscourseTopic($title, $url, $posts, $url, false);
+			}
+		}
+
+		return null;
+	}
+
+	/**
+	 * @param mixed $schema
+	 * @return array<int,array<string,mixed>>
+	 */
+	private function flattenSchemaItems(mixed $schema): array
+	{
+		if (!is_array($schema)) {
+			return [];
+		}
+
+		if (array_is_list($schema)) {
+			$items = [];
+			foreach ($schema as $item) {
+				if (is_array($item)) {
+					$items = array_merge($items, $this->flattenSchemaItems($item));
+				}
+			}
+
+			return $items;
+		}
+
+		$items = [$schema];
+		if (isset($schema['@graph']) && is_array($schema['@graph'])) {
+			foreach ($schema['@graph'] as $item) {
+				if (is_array($item)) {
+					$items = array_merge($items, $this->flattenSchemaItems($item));
+				}
+			}
+		}
+
+		return $items;
+	}
+
+	/**
+	 * @param array<string,mixed> $schema
+	 */
+	private function schemaTypeMatches(array $schema, string $type): bool
+	{
+		$schemaType = $schema['@type'] ?? null;
+		if (is_string($schemaType)) {
+			return strcasecmp($schemaType, $type) === 0;
+		}
+
+		if (is_array($schemaType)) {
+			foreach ($schemaType as $candidate) {
+				if (is_string($candidate) && strcasecmp($candidate, $type) === 0) {
+					return true;
+				}
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * @param mixed $value
+	 * @return array<int,mixed>
+	 */
+	private function schemaNodeList(mixed $value): array
+	{
+		if (!is_array($value)) {
+			return [];
+		}
+
+		return array_is_list($value) ? $value : [$value];
+	}
+
+	private function schemaString(mixed $value): string
+	{
+		if (is_string($value)) {
+			return trim($value);
+		}
+
+		if (is_int($value) || is_float($value)) {
+			return (string)$value;
+		}
+
+		return '';
+	}
+
+	/**
+	 * @param array<string,mixed> $schema
+	 */
+	private function schemaAuthorName(array $schema): string
+	{
+		$author = $schema['author'] ?? null;
+		if (is_array($author)) {
+			return $this->schemaString($author['name'] ?? null);
+		}
+
+		return $this->schemaString($author);
+	}
+
+	private function formatSchemaText(string $text): string
+	{
+		$text = trim(html_entity_decode($text, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+		if ($text === '') {
+			return '';
+		}
+
+		$html = '';
+		$paragraphs = preg_split('/\R{2,}/', $text);
+		if ($paragraphs === false) {
+			$paragraphs = [$text];
+		}
+
+		foreach ($paragraphs as $paragraph) {
+			$paragraph = trim($paragraph);
+			if ($paragraph === '') {
+				continue;
+			}
+
+			$html .= '<p>' . nl2br(htmlspecialchars($paragraph, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'), false) . '</p>';
 		}
 
 		return $html;
@@ -613,7 +841,7 @@ class Af_ReadabilityExtension extends Minz_Extension
 	private function cleanDiscoursePostContent(string $content): string
 	{
 		$content = preg_replace(
-			'#<p>\s*<a\s+[^>]*>\s*(阅读完整话题|read full topic)\s*</a>\s*</p>#iu',
+			'#<p>\s*<a\s+[^>]*>\s*(阅读完整话题|read full topic)\s*</a>\s*</p>#i',
 			'',
 			$content
 		);
