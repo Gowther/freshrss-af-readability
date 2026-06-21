@@ -162,31 +162,22 @@ class Af_ReadabilityExtension extends Minz_Extension
 			return false;
 		}
 
-		$ch = curl_init();
-		if(false === $ch) {
-			return false;
+		$discourseContent = $this->extractDiscourseContent($url);
+		if (is_string($discourseContent)) {
+			return $discourseContent;
 		}
-		curl_setopt($ch, CURLOPT_URL, $url);
-		curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-		curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-		curl_setopt($ch, CURLOPT_USERAGENT, FRESHRSS_USERAGENT);
-		curl_setopt($ch, CURLOPT_HTTPHEADER, [
+
+		$result = $this->fetchUrl($url, [
 			'Accept: text/*',
 			'Content-Type: text/html'
 		]);
-		curl_setopt($ch, CURLOPT_ACCEPT_ENCODING, '');
-		curl_setopt($ch, CURLOPT_TIMEOUT, 15);
-		curl_setopt($ch, CURLOPT_MAXFILESIZE, 1024 * 1024 * 2);
-		$response = curl_exec($ch);
-		if (curl_errno($ch)) {
-			return false;
-		}
-		$url = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL) ?: $url;
-		curl_close($ch);
 
-		if (!is_string($response)) {
+		if ($result === null) {
 			return false;
 		}
+
+		$response = $result['body'];
+		$url = $result['effectiveUrl'];
 
 		$document = new DOMDocument("1.0", "UTF-8");
 
@@ -224,5 +215,202 @@ class Af_ReadabilityExtension extends Minz_Extension
 		}
 
 		return false;
+	}
+
+	/**
+	 * @return array{body:string,effectiveUrl:string}|null
+	 */
+	private function fetchUrl(string $url, array $headers): ?array
+	{
+		$ch = curl_init();
+		if(false === $ch) {
+			return null;
+		}
+		curl_setopt($ch, CURLOPT_URL, $url);
+		curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+		curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+		curl_setopt($ch, CURLOPT_USERAGENT, FRESHRSS_USERAGENT);
+		curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+		curl_setopt($ch, CURLOPT_ACCEPT_ENCODING, '');
+		curl_setopt($ch, CURLOPT_TIMEOUT, 15);
+		curl_setopt($ch, CURLOPT_MAXFILESIZE, 1024 * 1024 * 2);
+		$response = curl_exec($ch);
+		if (curl_errno($ch)) {
+			curl_close($ch);
+			return null;
+		}
+		$effectiveUrl = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL) ?: $url;
+		curl_close($ch);
+
+		if (!is_string($response)) {
+			return null;
+		}
+
+		return [
+			'body' => $response,
+			'effectiveUrl' => $effectiveUrl,
+		];
+	}
+
+	private function extractDiscourseContent(string $url): bool|string|null
+	{
+		$rssUrl = $this->buildDiscourseTopicRssUrl($url);
+		if ($rssUrl === null) {
+			return null;
+		}
+
+		$result = $this->fetchUrl($rssUrl, [
+			'Accept: application/rss+xml, application/xml, text/xml, text/*',
+			'Content-Type: application/rss+xml'
+		]);
+
+		if ($result === null) {
+			return null;
+		}
+
+		return $this->parseDiscourseTopicRss($result['body'], $result['effectiveUrl']);
+	}
+
+	private function buildDiscourseTopicRssUrl(string $url): ?string
+	{
+		$parts = parse_url($url);
+		if (!is_array($parts)
+			|| !isset($parts['scheme'], $parts['host'], $parts['path'])
+		) {
+			return null;
+		}
+
+		$path = rtrim($parts['path'], '/');
+		if (str_ends_with($path, '.rss')) {
+			return $this->buildUrl($parts, $path);
+		}
+
+		if (!preg_match('#^(.*/t/(?:[^/]+/)?\d+)(?:/\d+)?$#', $path, $matches)) {
+			return null;
+		}
+
+		return $this->buildUrl($parts, $matches[1] . '.rss');
+	}
+
+	/**
+	 * @param array<string,int|string> $parts
+	 */
+	private function buildUrl(array $parts, string $path): string
+	{
+		$port = isset($parts['port']) ? ':' . $parts['port'] : '';
+
+		return $parts['scheme'] . '://' . $parts['host'] . $port . $path;
+	}
+
+	private function parseDiscourseTopicRss(string $rss, string $rssUrl): ?string
+	{
+		$document = new DOMDocument("1.0", "UTF-8");
+
+		libxml_use_internal_errors(true);
+		if (!$document->loadXML($rss, LIBXML_NOCDATA)) {
+			libxml_clear_errors();
+			return null;
+		}
+		libxml_clear_errors();
+
+		$channel = $document->getElementsByTagName('channel')->item(0);
+		if (!$channel instanceof DOMElement) {
+			return null;
+		}
+
+		$title = $this->getFirstElementText($channel, 'title');
+		$topicLink = $this->getFirstElementText($channel, 'link');
+		$posts = [];
+
+		foreach ($document->getElementsByTagName('item') as $item) {
+			if (!$item instanceof DOMElement) {
+				continue;
+			}
+
+			$content = $this->cleanDiscoursePostContent($this->getFirstElementText($item, 'description'));
+			if (trim(strip_tags($content)) === '') {
+				continue;
+			}
+
+			$posts[] = [
+				'author' => $this->getFirstElementText($item, 'creator', 'http://purl.org/dc/elements/1.1/'),
+				'content' => $content,
+				'link' => $this->getFirstElementText($item, 'link'),
+				'date' => $this->getFirstElementText($item, 'pubDate'),
+			];
+		}
+
+		if (empty($posts)) {
+			return null;
+		}
+
+		// Discourse topic RSS is newest-first; FreshRSS article content is easier to read oldest-first.
+		$posts = array_reverse($posts);
+		$html = '<article class="af-readability-discourse-topic">';
+
+		if ($title !== '') {
+			$titleHtml = htmlspecialchars($title, ENT_QUOTES, 'UTF-8');
+			if ($topicLink !== '') {
+				$html .= '<h1><a href="' . htmlspecialchars($topicLink, ENT_QUOTES, 'UTF-8') . '">' . $titleHtml . '</a></h1>';
+			} else {
+				$html .= '<h1>' . $titleHtml . '</h1>';
+			}
+		}
+
+		foreach ($posts as $index => $post) {
+			$postNumber = $index + 1;
+			$author = htmlspecialchars($post['author'], ENT_QUOTES, 'UTF-8');
+			$date = htmlspecialchars($post['date'], ENT_QUOTES, 'UTF-8');
+			$link = htmlspecialchars($post['link'], ENT_QUOTES, 'UTF-8');
+			$heading = '#' . $postNumber;
+
+			if ($author !== '') {
+				$heading .= ' - ' . $author;
+			}
+			if ($date !== '') {
+				$heading .= ' - ' . $date;
+			}
+
+			$html .= '<section class="af-readability-discourse-post">';
+			if ($link !== '') {
+				$html .= '<h2><a href="' . $link . '">' . $heading . '</a></h2>';
+			} else {
+				$html .= '<h2>' . $heading . '</h2>';
+			}
+			$html .= $post['content'];
+			$html .= '</section>';
+		}
+
+		$html .= '<p><a href="' . htmlspecialchars($rssUrl, ENT_QUOTES, 'UTF-8') . '">Topic RSS</a></p>';
+		$html .= '</article>';
+
+		return $html;
+	}
+
+	private function getFirstElementText(DOMElement $parent, string $tagName, ?string $namespace = null): string
+	{
+		if ($namespace !== null) {
+			$nodes = $parent->getElementsByTagNameNS($namespace, $tagName);
+		} else {
+			$nodes = $parent->getElementsByTagName($tagName);
+		}
+
+		$node = $nodes->item(0);
+		if (!$node instanceof DOMNode) {
+			return '';
+		}
+
+		return trim($node->textContent);
+	}
+
+	private function cleanDiscoursePostContent(string $content): string
+	{
+		$content = preg_replace(
+			'#<p>\s*<a\s+[^>]*>\s*(阅读完整话题|read full topic)\s*</a>\s*</p>#iu',
+			'',
+			$content
+		);
+
+		return trim($content ?? '');
 	}
 }
