@@ -67,7 +67,7 @@ To reprocess existing articles:
 ## Limitations
 Some web servers temporarily block too many subsequent HTTP requests from the same IP address. In the case of af_readability, the plugin tries to fetch multiple URLs from all new feed items one after the other without delay. This is often the reason why some article contents are not displayed properly.
 
-Discourse topic URLs such as `/t/topic/12345` are handled by fetching `/t/topic/12345.rss` and combining the topic posts. If the topic RSS cannot be fetched or parsed, the extension falls back to the generic Readability extraction path.
+Discourse topic URLs such as `/t/topic/12345` are handled by fetching `/t/topic/12345.rss` and combining the topic posts. If the topic RSS cannot be fetched or parsed, the extension tries Discourse's crawler HTML before falling back to the generic Readability extraction path.
 
 ## Troubleshooting
 

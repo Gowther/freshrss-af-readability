@@ -198,6 +198,11 @@ class Af_ReadabilityExtension extends Minz_Extension
 			}
 		}
 
+		$discourseCrawlerContent = $this->parseDiscourseCrawlerDocument($document, $url);
+		if (is_string($discourseCrawlerContent)) {
+			return $discourseCrawlerContent;
+		}
+
 		try {
 			$r = new Readability(new Configuration([
 				'FixRelativeURLs' => true,
@@ -210,7 +215,7 @@ class Af_ReadabilityExtension extends Minz_Extension
 			}
 		}
 		catch(\Throwable $t) {
-			Minz_Log::warning('af-readability: ' . $t->getMessage());
+			Minz_Log::warning('af-readability: Readability failed for ' . $url . ': ' . $t->getMessage());
 			return false;
 		}
 
@@ -265,10 +270,17 @@ class Af_ReadabilityExtension extends Minz_Extension
 		]);
 
 		if ($result === null) {
-			return null;
+			Minz_Log::warning('af-readability: Discourse RSS fetch failed for ' . $rssUrl);
+			return false;
 		}
 
-		return $this->parseDiscourseTopicRss($result['body'], $result['effectiveUrl']);
+		$content = $this->parseDiscourseTopicRss($result['body'], $result['effectiveUrl']);
+		if ($content === null) {
+			Minz_Log::warning('af-readability: Discourse RSS parse returned no posts for ' . $result['effectiveUrl']);
+			return false;
+		}
+
+		return $content;
 	}
 
 	private function buildDiscourseTopicRssUrl(string $url): ?string
@@ -401,6 +413,96 @@ class Af_ReadabilityExtension extends Minz_Extension
 		}
 
 		return trim($node->textContent);
+	}
+
+	private function parseDiscourseCrawlerDocument(DOMDocument $document, string $url): ?string
+	{
+		$xpath = new DOMXPath($document);
+		$posts = $xpath->query(
+			"//*[contains(concat(' ', normalize-space(@class), ' '), ' topic-body ')"
+			. " and contains(concat(' ', normalize-space(@class), ' '), ' crawler-post ')]"
+		);
+
+		if (!$posts instanceof DOMNodeList || $posts->length === 0) {
+			return null;
+		}
+
+		$title = $this->getDocumentTitle($document);
+		$html = '<article class="af-readability-discourse-topic">';
+
+		if ($title !== '') {
+			$html .= '<h1><a href="' . htmlspecialchars($url, ENT_QUOTES, 'UTF-8') . '">'
+				. htmlspecialchars($title, ENT_QUOTES, 'UTF-8')
+				. '</a></h1>';
+		}
+
+		$postNumber = 0;
+		foreach ($posts as $post) {
+			if (!$post instanceof DOMElement) {
+				continue;
+			}
+
+			$contentNode = $this->findFirstDescendantByClass($post, 'cooked');
+			if (!$contentNode instanceof DOMElement) {
+				continue;
+			}
+
+			$content = $this->cleanDiscoursePostContent($this->innerHtml($contentNode));
+			if (trim(strip_tags($content)) === '') {
+				continue;
+			}
+
+			$postNumber++;
+			$postLink = $url . '#post_' . $postNumber;
+			$html .= '<section class="af-readability-discourse-post">';
+			$html .= '<h2><a href="' . htmlspecialchars($postLink, ENT_QUOTES, 'UTF-8') . '">#' . $postNumber . '</a></h2>';
+			$html .= $content;
+			$html .= '</section>';
+		}
+
+		$html .= '</article>';
+
+		if ($postNumber === 0) {
+			return null;
+		}
+
+		return $html;
+	}
+
+	private function getDocumentTitle(DOMDocument $document): string
+	{
+		$titleNode = $document->getElementsByTagName('title')->item(0);
+		if (!$titleNode instanceof DOMNode) {
+			return '';
+		}
+
+		return trim($titleNode->textContent);
+	}
+
+	private function findFirstDescendantByClass(DOMElement $parent, string $className): ?DOMElement
+	{
+		foreach ($parent->getElementsByTagName('*') as $element) {
+			if (!$element instanceof DOMElement) {
+				continue;
+			}
+
+			$classes = ' ' . preg_replace('/\s+/', ' ', $element->getAttribute('class')) . ' ';
+			if (str_contains($classes, ' ' . $className . ' ')) {
+				return $element;
+			}
+		}
+
+		return null;
+	}
+
+	private function innerHtml(DOMNode $node): string
+	{
+		$html = '';
+		foreach ($node->childNodes as $child) {
+			$html .= $node->ownerDocument?->saveHTML($child) ?: '';
+		}
+
+		return $html;
 	}
 
 	private function cleanDiscoursePostContent(string $content): string
